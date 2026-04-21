@@ -1,0 +1,67 @@
+{
+  "project_info": {
+    "project_number": "1066071540494",
+    "project_id": "asempa-choir-app",
+    "storage_bucket": "asempa-choir-app.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1066071540494:android:0efc449e069cfdcb6e0d5f",
+        "android_client_info": {
+          "package_name": "com.example.asempa_choir"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD2lrzPY0x1Mpq7ZN7aDir-AdKlbha0uHk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1066071540494:android:18f15318e407aada6e0d5f",
+        "android_client_info": {
+          "package_name": "com.nupsgumat.asempa_choir_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD2lrzPY0x1Mpq7ZN7aDir-AdKlbha0uHk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1066071540494:android:96f745bd4c28bbb06e0d5f",
+        "android_client_info": {
+          "package_name": "com.nupsumat.asempa_choir_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD2lrzPY0x1Mpq7ZN7aDir-AdKlbha0uHk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
