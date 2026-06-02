@@ -53,7 +53,7 @@ app.post("/wallet/topup", async (req, res) => {
       amount, currency: "GHS",
       description: "Asempa Choir Wallet Top-up",
       customer_email: user.email,
-      customer_name: user.fullName,
+     customer_name: user.name,  // ✅
       callback_url: `${SERVER_URL}/wallet-topup-success`,
       metadata: { uid, type: "wallet_topup", amount },
     });
