@@ -318,10 +318,22 @@ app.post("/webhook", async (req, res) => {
     console.log("   Body:", JSON.stringify(req.body));
 
     if (!signature) {
-      console.warn("⚠️  No signature header — proceeding anyway for debug");
-    } else if (signature !== RUSHPAY_WEBHOOK_SECRET) {
-      console.warn("⚠️  Signature mismatch — expected:", RUSHPAY_WEBHOOK_SECRET, "got:", signature);
-    }
+  console.warn("⚠️  No signature header — rejecting");
+  return res.status(401).json({ success: false, message: "No signature" });
+}
+
+const rawBody = JSON.stringify(req.body);
+const expected = crypto
+  .createHmac("sha256", RUSHPAY_WEBHOOK_SECRET)
+  .update(rawBody)
+  .digest("hex");
+
+if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+  console.warn("⚠️  Signature mismatch — expected:", expected, "got:", signature);
+  return res.status(401).json({ success: false, message: "Invalid signature" });
+}
+
+console.log("✅ Signature verified");
 
     const event = req.body;
     if (event.event !== "payment.completed") {
