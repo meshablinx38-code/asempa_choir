@@ -1,5 +1,6 @@
 const crypto = require("node:crypto");
-const express = require("express");const axios = require("axios");
+const express = require("express");
+const axios = require("axios");
 const cors = require("cors");
 const admin = require("firebase-admin");
 
@@ -192,8 +193,6 @@ app.patch("/donations/campaign/:id", async (req, res) => {
   }
 });
 
-// ── POST /donations/pay ───────────────────────────────────────────────────
-// Creates a RushPay payment for a donation campaign
 app.post("/donations/pay", async (req, res) => {
   try {
     const { uid, campaignId, amount } = req.body;
@@ -239,7 +238,6 @@ app.post("/donations/pay", async (req, res) => {
   }
 });
 
-// ── GET /donations/checkout/:reference ───────────────────────────────────
 app.get("/donations/checkout/:reference", async (req, res) => {
   try {
     const { reference } = req.params;
@@ -318,22 +316,22 @@ app.post("/webhook", async (req, res) => {
     console.log("   Body:", JSON.stringify(req.body));
 
     if (!signature) {
-  console.warn("⚠️  No signature header — rejecting");
-  return res.status(401).json({ success: false, message: "No signature" });
-}
+      console.warn("⚠️  No signature header — rejecting");
+      return res.status(401).json({ success: false, message: "No signature" });
+    }
 
-const rawBody = JSON.stringify(req.body);
-const expected = crypto
-  .createHmac("sha256", RUSHPAY_WEBHOOK_SECRET)
-  .update(rawBody)
-  .digest("hex");
+    const rawBody = JSON.stringify(req.body);
+    const expected = crypto
+      .createHmac("sha256", RUSHPAY_WEBHOOK_SECRET)
+      .update(rawBody)
+      .digest("hex");
 
-if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
-  console.warn("⚠️  Signature mismatch — expected:", expected, "got:", signature);
-  return res.status(401).json({ success: false, message: "Invalid signature" });
-}
+    if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+      console.warn("⚠️  Signature mismatch — expected:", expected, "got:", signature);
+      return res.status(401).json({ success: false, message: "Invalid signature" });
+    }
 
-console.log("✅ Signature verified");
+    console.log("✅ Signature verified");
 
     const event = req.body;
     if (event.event !== "payment.completed") {
@@ -341,22 +339,33 @@ console.log("✅ Signature verified");
       return res.json({ success: true, message: "Event ignored" });
     }
 
-    const { payment_reference, amount, metadata } = event.data;
-    const { uid, type, semester, campaignId } = metadata ?? {};
-    if (!uid) return res.status(400).json({ success: false, message: "Missing uid" });
+    const { payment_reference, amount } = event.data;
 
-    // ── Donation ──────────────────────────────────────────────────────────
-    if (type === "donation") {
-      if (!campaignId) return res.status(400).json({ success: false, message: "Missing campaignId" });
+    // ── Look up by reference — don't rely on metadata ─────────────────
+    const [donationSnap, duesSnap] = await Promise.all([
+      db.collection("donation_pending")
+        .where("paymentReference", "==", payment_reference).limit(1).get(),
+      db.collection("dues_payments")
+        .where("paymentReference", "==", payment_reference).limit(1).get(),
+    ]);
 
-      const pendingSnap = await db.collection("donation_pending")
-        .where("paymentReference", "==", payment_reference).limit(1).get();
-      if (!pendingSnap.empty)
-        await pendingSnap.docs[0].ref.update({
-          status: "completed",
-          completedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
+    if (donationSnap.empty && duesSnap.empty) {
+      console.warn("⚠️  No pending record found for:", payment_reference);
+      return res.status(400).json({ success: false, message: "Unknown payment reference" });
+    }
 
+    const isDonation = !donationSnap.empty;
+    const pendingDoc = isDonation ? donationSnap.docs[0] : duesSnap.docs[0];
+    const { uid, campaignId, semester } = pendingDoc.data();
+
+    // Mark pending as completed
+    await pendingDoc.ref.update({
+      status: "completed",
+      completedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // ── Donation ──────────────────────────────────────────────────────
+    if (isDonation) {
       const campaignRef = db.collection("donation_campaigns").doc(campaignId);
       const userDoc     = await db.collection("users").doc(uid).get();
       const userData    = userDoc.data();
@@ -371,8 +380,7 @@ console.log("✅ Signature verified");
           donorCount:   admin.firestore.FieldValue.increment(1),
         });
 
-        const donationRef = db.collection("donations").doc();
-        t.set(donationRef, {
+        t.set(db.collection("donations").doc(), {
           uid, campaignId, amount,
           name:             userName,
           voicePart:        userData?.voicePart ?? "",
@@ -385,30 +393,20 @@ console.log("✅ Signature verified");
       return res.json({ success: true });
     }
 
-    // ── Dues direct payment ───────────────────────────────────────────────
-    if (!semester) return res.status(400).json({ success: false, message: "Missing semester" });
-
-    const paymentsSnap = await db.collection("dues_payments")
-      .where("paymentReference", "==", payment_reference).limit(1).get();
-    if (!paymentsSnap.empty)
-      await paymentsSnap.docs[0].ref.update({
-        status: "completed",
-        paidAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-    const duesRef  = db.collection("dues").doc(safeSemesterId(uid, semester));
-    const duesDoc  = await duesRef.get();
+    // ── Dues ──────────────────────────────────────────────────────────
+    const duesRef      = db.collection("dues").doc(safeSemesterId(uid, semester));
+    const duesDoc      = await duesRef.get();
     const previousPaid = duesDoc.exists ? duesDoc.data().amountPaid ?? 0 : 0;
-    const newTotal = previousPaid + amount;
-    const userDoc  = await db.collection("users").doc(uid).get();
-    const userData = userDoc.data();
-    const isAdmin  = userData?.isAdmin === true;
-    const required = isAdmin ? DUES.admin : DUES.member;
-    const userName = userData?.name ?? userData?.fullName ?? "";
+    const newTotal     = previousPaid + amount;
+    const userDoc      = await db.collection("users").doc(uid).get();
+    const userData     = userDoc.data();
+    const isAdmin      = userData?.isAdmin === true;
+    const userName     = userData?.name ?? userData?.fullName ?? "";
 
     await duesRef.set({
-      uid, semester, amountPaid: newTotal, amountRequired: required,
-      isPaid: newTotal >= required,
+      uid, semester, amountPaid: newTotal,
+      amountRequired: isAdmin ? DUES.admin : DUES.member,
+      isPaid: newTotal >= (isAdmin ? DUES.admin : DUES.member),
       lastPaymentAt: admin.firestore.FieldValue.serverTimestamp(),
       role:      isAdmin ? "admin" : "member",
       name:      userName,
@@ -417,6 +415,7 @@ console.log("✅ Signature verified");
 
     console.log(`✅ Dues credited: uid=${uid} semester=${semester} amount=${amount}`);
     return res.json({ success: true });
+
   } catch (err) {
     console.error("webhook error:", err.message);
     return res.status(500).json({ success: false, message: "Webhook processing failed" });
