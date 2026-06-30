@@ -13,9 +13,9 @@ const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
-// ── RushPay config ────────────────────────────────────────────────────────
+// ── RushPay config (V2) ───────────────────────────────────────────────────
 const RUSHPAY_API_KEY        = process.env.RUSHPAY_API_KEY;
-const RUSHPAY_BASE_URL       = "https://api.rushpay.cash/v1";
+const RUSHPAY_BASE_URL       = "https://core.rushpay.cash";
 const RUSHPAY_WEBHOOK_SECRET = process.env.RUSHPAY_WEBHOOK_SECRET;
 const SERVER_URL = process.env.SERVER_URL || "https://asempachoir-production.up.railway.app";
 
@@ -29,6 +29,9 @@ const rushpay = axios.create({
 // ── Helpers ───────────────────────────────────────────────────────────────
 const safeSemesterId = (uid, semester) =>
   `${uid}_${semester.replace(/\//g, "-").replace(/ /g, "_")}`;
+
+// Format amount as a string with 2 decimals (RushPay V2 expects amount as a string)
+const fmtAmount = (n) => Number(n).toFixed(2);
 
 // ── Health check ──────────────────────────────────────────────────────────
 app.get("/", (req, res) => res.json({ status: "Asempa backend running" }));
@@ -51,13 +54,17 @@ app.post("/create-payment", async (req, res) => {
     const isAdmin = user.isAdmin === true;
     const amount  = isAdmin ? DUES.admin : DUES.member;
 
-    const response = await rushpay.post("/payments/create", {
-      amount, currency: "GHS",
+    const response = await rushpay.post("/api/v1/merchant/payments/create", {
+      amount: fmtAmount(amount),
       description: `Asempa Choir Dues — ${semester}`,
-      customer_email: user.email,
-      customer_name: user.name ?? user.fullName ?? "Member",
       callback_url: `${SERVER_URL}/payment-success`,
-      metadata: { uid, semester, role: isAdmin ? "admin" : "member" },
+      metadata: {
+        uid,
+        semester,
+        role: isAdmin ? "admin" : "member",
+        customer_email: user.email,
+        customer_name: user.name ?? user.fullName ?? "Member",
+      },
     });
 
     console.log("RushPay create-payment response:", JSON.stringify(response.data, null, 2));
@@ -84,7 +91,7 @@ app.post("/create-payment", async (req, res) => {
 app.get("/checkout/:reference", async (req, res) => {
   try {
     const { reference } = req.params;
-    const sessionRes = await rushpay.post("/payments/widget-session", {
+    const sessionRes = await rushpay.post("/api/v1/merchant/payments/widget-session", {
       payment_reference: reference,
     });
     const widgetSessionToken = sessionRes.data?.data?.widget_session_token;
@@ -97,7 +104,6 @@ app.get("/checkout/:reference", async (req, res) => {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Asempa Choir — Pay Dues</title>
-  <link rel="stylesheet" href="https://api.rushpay.cash/widget/payment-widget.css">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -115,14 +121,13 @@ app.get("/checkout/:reference", async (req, res) => {
     <p>Secure dues payment powered by RushPay</p>
   </div>
   <div id="rushpay-payment-widget"></div>
-  <script>window.RUSHPAY_API_BASE = 'https://api.rushpay.cash/v1';</script>
-  <script src="https://api.rushpay.cash/widget/payment-widget.js"></script>
+  <script src="https://core.rushpay.cash/widget/payment-widget-v2.js"></script>
   <script>
-    RushPay.init({
-      widgetSessionToken: '${widgetSessionToken}',
+    RushPayV2.init({
+      containerId: "rushpay-payment-widget",
       paymentReference: '${reference}',
-      callbackUrl: '${SERVER_URL}/payment-success',
-      description: 'Asempa Choir Dues'
+      widgetSessionToken: '${widgetSessionToken}',
+      callbackUrl: '${SERVER_URL}/payment-success'
     });
   </script>
 </body>
@@ -150,7 +155,7 @@ app.get("/payment-success", (req, res) => {
 app.get("/verify/:reference", async (req, res) => {
   try {
     const { reference } = req.params;
-    const response = await rushpay.get(`/payments/verify?payment_reference=${reference}`);
+    const response = await rushpay.get(`/api/v1/merchant/payments/status?payment_reference=${reference}`);
     const payment = response.data?.data ?? response.data;
     return res.json({ success: true, status: payment.status, amount: payment.amount });
   } catch (err) {
@@ -209,13 +214,18 @@ app.post("/donations/pay", async (req, res) => {
     const user     = userDoc.data();
     const campaign = campaignDoc.data();
 
-    const response = await rushpay.post("/payments/create", {
-      amount, currency: "GHS",
+    const response = await rushpay.post("/api/v1/merchant/payments/create", {
+      amount: fmtAmount(amount),
       description: `Donation — ${campaign.name}`,
-      customer_email: user.email,
-      customer_name: user.name ?? user.fullName ?? "Member",
       callback_url: `${SERVER_URL}/donation-success`,
-      metadata: { uid, campaignId, type: "donation", amount },
+      metadata: {
+        uid,
+        campaignId,
+        type: "donation",
+        amount,
+        customer_email: user.email,
+        customer_name: user.name ?? user.fullName ?? "Member",
+      },
     });
 
     console.log("RushPay donation response:", JSON.stringify(response.data, null, 2));
@@ -241,7 +251,7 @@ app.post("/donations/pay", async (req, res) => {
 app.get("/donations/checkout/:reference", async (req, res) => {
   try {
     const { reference } = req.params;
-    const sessionRes = await rushpay.post("/payments/widget-session", {
+    const sessionRes = await rushpay.post("/api/v1/merchant/payments/widget-session", {
       payment_reference: reference,
     });
     const widgetSessionToken = sessionRes.data?.data?.widget_session_token;
@@ -254,7 +264,6 @@ app.get("/donations/checkout/:reference", async (req, res) => {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Asempa Choir — Donate</title>
-  <link rel="stylesheet" href="https://api.rushpay.cash/widget/payment-widget.css">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -272,14 +281,13 @@ app.get("/donations/checkout/:reference", async (req, res) => {
     <p>Thank you for your generosity</p>
   </div>
   <div id="rushpay-payment-widget"></div>
-  <script>window.RUSHPAY_API_BASE = 'https://api.rushpay.cash/v1';</script>
-  <script src="https://api.rushpay.cash/widget/payment-widget.js"></script>
+  <script src="https://core.rushpay.cash/widget/payment-widget-v2.js"></script>
   <script>
-    RushPay.init({
-      widgetSessionToken: '${widgetSessionToken}',
+    RushPayV2.init({
+      containerId: "rushpay-payment-widget",
       paymentReference: '${reference}',
-      callbackUrl: '${SERVER_URL}/donation-success',
-      description: 'Asempa Choir Donation'
+      widgetSessionToken: '${widgetSessionToken}',
+      callbackUrl: '${SERVER_URL}/donation-success'
     });
   </script>
 </body>
