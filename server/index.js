@@ -16,7 +16,7 @@ const db = admin.firestore();
 // ── RushPay config (V2) ───────────────────────────────────────────────────
 const RUSHPAY_API_KEY        = process.env.RUSHPAY_API_KEY;
 const RUSHPAY_BASE_URL       = "https://core.rushpay.cash";
-const RUSHPAY_API_BASE       = "https://core.rushpay.cash/api/v1"; // used by the browser widget
+const RUSHPAY_API_BASE       = "https://core.rushpay.cash"; // used by the browser widget (it appends /api/v1/merchant/... itself)
 const RUSHPAY_WEBHOOK_SECRET = process.env.RUSHPAY_WEBHOOK_SECRET;
 const SERVER_URL = process.env.SERVER_URL || "https://asempachoir-production.up.railway.app";
 
