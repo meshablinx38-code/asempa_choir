@@ -16,6 +16,7 @@ const db = admin.firestore();
 // ── RushPay config (V2) ───────────────────────────────────────────────────
 const RUSHPAY_API_KEY        = process.env.RUSHPAY_API_KEY;
 const RUSHPAY_BASE_URL       = "https://core.rushpay.cash";
+const RUSHPAY_API_BASE       = "https://core.rushpay.cash/api/v1"; // used by the browser widget
 const RUSHPAY_WEBHOOK_SECRET = process.env.RUSHPAY_WEBHOOK_SECRET;
 const SERVER_URL = process.env.SERVER_URL || "https://asempachoir-production.up.railway.app";
 
@@ -124,6 +125,7 @@ app.get("/checkout/:reference", async (req, res) => {
   <script src="https://core.rushpay.cash/widget/payment-widget-v2.js"></script>
   <script>
     RushPayV2.init({
+      apiBase: "${RUSHPAY_API_BASE}",
       containerId: "rushpay-payment-widget",
       paymentReference: '${reference}',
       widgetSessionToken: '${widgetSessionToken}',
@@ -284,6 +286,7 @@ app.get("/donations/checkout/:reference", async (req, res) => {
   <script src="https://core.rushpay.cash/widget/payment-widget-v2.js"></script>
   <script>
     RushPayV2.init({
+      apiBase: "${RUSHPAY_API_BASE}",
       containerId: "rushpay-payment-widget",
       paymentReference: '${reference}',
       widgetSessionToken: '${widgetSessionToken}',
