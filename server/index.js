@@ -3,6 +3,7 @@ const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
 const admin = require("firebase-admin");
+const cron = require("node-cron");
 
 const app = express();
 app.use(express.json());
@@ -12,6 +13,7 @@ app.use(cors());
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
+const { FieldValue, Timestamp } = admin.firestore;
 
 // ── RushPay config (V2) ───────────────────────────────────────────────────
 const RUSHPAY_API_KEY        = process.env.RUSHPAY_API_KEY;
@@ -33,6 +35,39 @@ const safeSemesterId = (uid, semester) =>
 
 // Format amount as a string with 2 decimals (RushPay V2 expects amount as a string)
 const fmtAmount = (n) => Number(n).toFixed(2);
+
+// Works for Firestore Timestamps AND the ISO strings older campaigns were saved with.
+// A deadline saved at exactly 00:00:00 is treated as the END of that day.
+const toDateSafe = (v) => {
+  if (!v) return null;
+  const d = typeof v.toDate === "function" ? v.toDate() : new Date(v);
+  if (isNaN(d.getTime())) return null;
+  if (d.getUTCHours() === 0 && d.getUTCMinutes() === 0 && d.getUTCSeconds() === 0) {
+    d.setUTCHours(23, 59, 59, 0);
+  }
+  return d;
+};
+
+// ── Admin guard: the app sends the Firebase ID token with admin requests ──
+async function requireAdmin(req, res, next) {
+  try {
+    const header = req.headers.authorization || "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+    if (!token) return res.status(401).json({ success: false, message: "Not signed in" });
+
+    const decoded = await admin.auth().verifyIdToken(token);
+    const snap = await db.collection("users").doc(decoded.uid).get();
+    const u = snap.data() || {};
+    if (!(u.isAdmin === true || u.role === "admin"))
+      return res.status(403).json({ success: false, message: "Admins only" });
+
+    req.adminUid = decoded.uid;
+    next();
+  } catch (err) {
+    console.error("requireAdmin error:", err.message);
+    return res.status(401).json({ success: false, message: "Invalid session" });
+  }
+}
 
 // ── Health check ──────────────────────────────────────────────────────────
 app.get("/", (req, res) => res.json({ status: "Asempa backend running" }));
@@ -79,7 +114,7 @@ app.post("/create-payment", async (req, res) => {
     await db.collection("dues_payments").add({
       uid, semester, amount, role: isAdmin ? "admin" : "member",
       paymentReference, status: "pending",
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: FieldValue.serverTimestamp(),
     });
 
     return res.json({ success: true, paymentReference, amount });
@@ -170,17 +205,29 @@ app.get("/verify/:reference", async (req, res) => {
 // DONATION CAMPAIGN ENDPOINTS
 // ══════════════════════════════════════════════════════════════════════════
 
-app.post("/donations/campaign", async (req, res) => {
+// Create campaign (admin only)
+app.post("/donations/campaign", requireAdmin, async (req, res) => {
   try {
-    const { name, description, targetAmount, deadline, createdBy } = req.body;
-    if (!name || !targetAmount || !createdBy)
-      return res.status(400).json({ success: false, message: "name, targetAmount, createdBy required" });
+    const { name, description, targetAmount, deadline, isActive } = req.body;
+    const target = Number(targetAmount);
+    if (!name || !target || target < 1)
+      return res.status(400).json({ success: false, message: "name and a valid targetAmount required" });
+
+    const deadlineDate = deadline ? new Date(deadline) : null;
+    if (deadlineDate && isNaN(deadlineDate.getTime()))
+      return res.status(400).json({ success: false, message: "Invalid deadline" });
 
     const ref = await db.collection("donation_campaigns").add({
-      name, description: description ?? "", targetAmount,
-      deadline: deadline ?? null, amountRaised: 0, donorCount: 0,
-      isActive: true, createdBy,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      name,
+      description: description ?? "",
+      targetAmount: target,
+      deadline: deadlineDate ? Timestamp.fromDate(deadlineDate) : null,
+      amountRaised: 0,
+      donorCount: 0,
+      isActive: isActive !== false,
+      remindersSent: [],
+      createdBy: req.adminUid,
+      createdAt: FieldValue.serverTimestamp(),
     });
 
     return res.json({ success: true, campaignId: ref.id });
@@ -190,9 +237,35 @@ app.post("/donations/campaign", async (req, res) => {
   }
 });
 
-app.patch("/donations/campaign/:id", async (req, res) => {
+// Edit campaign (admin only) — only whitelisted fields can change
+app.patch("/donations/campaign/:id", requireAdmin, async (req, res) => {
   try {
-    await db.collection("donation_campaigns").doc(req.params.id).update(req.body);
+    const update = {};
+    for (const k of ["name", "description", "targetAmount", "isActive", "deadline"]) {
+      if (k in req.body) update[k] = req.body[k];
+    }
+
+    if ("targetAmount" in update) {
+      update.targetAmount = Number(update.targetAmount);
+      if (!(update.targetAmount >= 1))
+        return res.status(400).json({ success: false, message: "Invalid targetAmount" });
+    }
+    if ("deadline" in update) {
+      if (update.deadline) {
+        const d = new Date(update.deadline);
+        if (isNaN(d.getTime()))
+          return res.status(400).json({ success: false, message: "Invalid deadline" });
+        update.deadline = Timestamp.fromDate(d);
+      } else {
+        update.deadline = null;
+      }
+      update.remindersSent = []; // new deadline -> reminder schedule restarts
+    }
+    if (Object.keys(update).length === 0)
+      return res.status(400).json({ success: false, message: "Nothing to update" });
+
+    update.updatedAt = FieldValue.serverTimestamp();
+    await db.collection("donation_campaigns").doc(req.params.id).update(update);
     return res.json({ success: true });
   } catch (err) {
     console.error("donations/campaign patch error:", err.message);
@@ -200,11 +273,37 @@ app.patch("/donations/campaign/:id", async (req, res) => {
   }
 });
 
+// Delete campaign (admin only). Donation records are kept for your accounts.
+app.delete("/donations/campaign/:id", requireAdmin, async (req, res) => {
+  try {
+    await db.collection("donation_campaigns").doc(req.params.id).delete();
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("donations/campaign delete error:", err.message);
+    return res.status(500).json({ success: false, message: "Delete failed" });
+  }
+});
+
+// Manual "Remind" button (admin only)
+app.post("/donations/campaign/:id/remind", requireAdmin, async (req, res) => {
+  try {
+    const doc = await db.collection("donation_campaigns").doc(req.params.id).get();
+    if (!doc.exists)
+      return res.status(404).json({ success: false, message: "Campaign not found" });
+    const sent = await remindCampaign(doc);
+    return res.json({ success: true, sent });
+  } catch (err) {
+    console.error("donations remind error:", err.message);
+    return res.status(500).json({ success: false, message: "Could not send reminders" });
+  }
+});
+
 app.post("/donations/pay", async (req, res) => {
   try {
-    const { uid, campaignId, amount } = req.body;
-    if (!uid || !campaignId || !amount || amount < 1)
-      return res.status(400).json({ success: false, message: "uid, campaignId, amount required" });
+    const { uid, campaignId } = req.body;
+    const amount = Number(req.body.amount);
+    if (!uid || !campaignId || !Number.isFinite(amount) || amount < 1 || amount > 10000)
+      return res.status(400).json({ success: false, message: "uid, campaignId and an amount between 1 and 10,000 required" });
 
     const userDoc     = await db.collection("users").doc(uid).get();
     const campaignDoc = await db.collection("donation_campaigns").doc(campaignId).get();
@@ -215,6 +314,13 @@ app.post("/donations/pay", async (req, res) => {
 
     const user     = userDoc.data();
     const campaign = campaignDoc.data();
+
+    // Enforce closed / ended campaigns on the server too
+    if (campaign.isActive === false)
+      return res.status(400).json({ success: false, message: "This campaign is closed" });
+    const deadline = toDateSafe(campaign.deadline);
+    if (deadline && new Date() > deadline)
+      return res.status(400).json({ success: false, message: "This campaign has ended" });
 
     const response = await rushpay.post("/api/v1/merchant/payments/create", {
       amount: fmtAmount(amount),
@@ -240,7 +346,7 @@ app.post("/donations/pay", async (req, res) => {
 
     await db.collection("donation_pending").add({
       uid, campaignId, amount, paymentReference, status: "pending",
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAt: FieldValue.serverTimestamp(),
     });
 
     return res.json({ success: true, paymentReference, amount });
@@ -316,6 +422,94 @@ app.get("/donation-success", (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════
+// DONATION REMINDERS
+// ══════════════════════════════════════════════════════════════════════════
+
+const money = (n) => "GHS " + Math.round(n).toLocaleString("en-US");
+
+function reminderMessage(c, daysLeft) {
+  const progress = `${money(c.amountRaised || 0)} of ${money(c.targetAmount || 0)} raised.`;
+  if (daysLeft === 0) return { title: `⏰ Last day: ${c.name}`, body: `Ends tonight! ${progress} Tap to give.` };
+  if (daysLeft === 1) return { title: `⏳ 1 day left: ${c.name}`, body: `Ends tomorrow. ${progress}` };
+  if (daysLeft == null) return { title: `💝 ${c.name}`, body: `${progress} Every gift counts.` };
+  return { title: `⏳ ${daysLeft} days left: ${c.name}`, body: `${progress} Every gift counts.` };
+}
+
+/** Push to every approved, active member who has NOT donated to this campaign. */
+async function remindCampaign(campaignDoc, daysLeft = null) {
+  const c = campaignDoc.data();
+
+  // Your webhook writes a `donations` record only after a successful payment,
+  // so every record here is a real donation.
+  const donationsSnap = await db.collection("donations")
+    .where("campaignId", "==", campaignDoc.id).get();
+  const donated = new Set(donationsSnap.docs.map((d) => d.data().uid));
+
+  const usersSnap = await db.collection("users").where("isApproved", "==", true).get();
+  const tokens = [];
+  usersSnap.forEach((u) => {
+    const d = u.data();
+    if (d.isActive === false) return;   // deactivated member
+    if (donated.has(u.id)) return;      // already gave -> skip
+    if (d.fcmToken) tokens.push(d.fcmToken);
+  });
+  if (!tokens.length) return 0;
+
+  const { title, body } = reminderMessage(c, daysLeft);
+  let sent = 0;
+  for (let i = 0; i < tokens.length; i += 500) {
+    const r = await admin.messaging().sendEachForMulticast({
+      tokens: tokens.slice(i, i + 500),
+      notification: { title, body },
+      data: { route: "/donations", campaignId: campaignDoc.id },
+    });
+    sent += r.successCount;
+  }
+  console.log(`🔔 Reminder "${c.name}" sent to ${sent}/${tokens.length}`);
+  return sent;
+}
+
+// Remind 7, 3 and 1 days before the deadline, and on the last day.
+const REMINDER_STAGES = [7, 3, 1, 0];
+const DAY_MS = 24 * 60 * 60 * 1000;
+// Accra is UTC+0 all year, so UTC day maths matches local days.
+const startOfDayUTC = (d) => Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+
+async function runDailyReminders() {
+  const snap = await db.collection("donation_campaigns").where("isActive", "==", true).get();
+  for (const doc of snap.docs) {
+    const c = doc.data();
+    const deadline = toDateSafe(c.deadline);
+    if (!deadline || new Date() > deadline) continue;
+
+    const daysLeft = Math.round((startOfDayUTC(deadline) - startOfDayUTC(new Date())) / DAY_MS);
+    if (!REMINDER_STAGES.includes(daysLeft)) continue;
+    if ((c.remindersSent || []).includes(daysLeft)) continue; // stage already sent
+
+    try {
+      await remindCampaign(doc, daysLeft);
+      await doc.ref.update({ remindersSent: FieldValue.arrayUnion(daysLeft) });
+    } catch (err) {
+      console.error("Reminder failed for", doc.id, err.message);
+    }
+  }
+}
+
+// Every day at 09:00 Accra time
+cron.schedule("0 9 * * *", () => {
+  runDailyReminders().catch((e) => console.error("Daily reminders error:", e.message));
+}, { timezone: "Africa/Accra" });
+
+// Optional: lets an external scheduler trigger it if Railway ever sleeps the service.
+// Set CRON_SECRET in Railway variables, then POST with header x-cron-secret.
+app.post("/donations/cron/run", async (req, res) => {
+  if (!process.env.CRON_SECRET || req.headers["x-cron-secret"] !== process.env.CRON_SECRET)
+    return res.status(403).json({ success: false });
+  await runDailyReminders();
+  return res.json({ success: true });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
 // WEBHOOK
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -337,7 +531,9 @@ app.post("/webhook", async (req, res) => {
       .update(rawBody)
       .digest("hex");
 
-    if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+    const sigBuf = Buffer.from(signature);
+    const expBuf = Buffer.from(expected);
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
       console.warn("⚠️  Signature mismatch — expected:", expected, "got:", signature);
       return res.status(401).json({ success: false, message: "Invalid signature" });
     }
@@ -367,12 +563,19 @@ app.post("/webhook", async (req, res) => {
 
     const isDonation = !donationSnap.empty;
     const pendingDoc = isDonation ? donationSnap.docs[0] : duesSnap.docs[0];
+
+    // Webhooks can be delivered more than once — never count a payment twice
+    if (pendingDoc.data().status === "completed") {
+      console.log("ℹ️  Already processed:", payment_reference);
+      return res.json({ success: true, message: "Already processed" });
+    }
+
     const { uid, campaignId, semester } = pendingDoc.data();
 
     // Mark pending as completed
     await pendingDoc.ref.update({
       status: "completed",
-      completedAt: admin.firestore.FieldValue.serverTimestamp(),
+      completedAt: FieldValue.serverTimestamp(),
     });
 
     // ── Donation ──────────────────────────────────────────────────────
@@ -387,8 +590,8 @@ app.post("/webhook", async (req, res) => {
         if (!campaignDoc.exists) throw new Error("Campaign not found");
 
         t.update(campaignRef, {
-          amountRaised: admin.firestore.FieldValue.increment(amount),
-          donorCount:   admin.firestore.FieldValue.increment(1),
+          amountRaised: FieldValue.increment(amount),
+          donorCount:   FieldValue.increment(1),
         });
 
         t.set(db.collection("donations").doc(), {
@@ -396,7 +599,7 @@ app.post("/webhook", async (req, res) => {
           name:             userName,
           voicePart:        userData?.voicePart ?? "",
           paymentReference: payment_reference,
-          donatedAt:        admin.firestore.FieldValue.serverTimestamp(),
+          donatedAt:        FieldValue.serverTimestamp(),
         });
       });
 
@@ -418,7 +621,7 @@ app.post("/webhook", async (req, res) => {
       uid, semester, amountPaid: newTotal,
       amountRequired: isAdmin ? DUES.admin : DUES.member,
       isPaid: newTotal >= (isAdmin ? DUES.admin : DUES.member),
-      lastPaymentAt: admin.firestore.FieldValue.serverTimestamp(),
+      lastPaymentAt: FieldValue.serverTimestamp(),
       role:      isAdmin ? "admin" : "member",
       name:      userName,
       voicePart: userData?.voicePart ?? "",
