@@ -6,8 +6,15 @@ const admin = require("firebase-admin");
 const cron = require("node-cron");
 
 const app = express();
-app.use(express.json());
 app.use(cors());
+// Keep the raw bytes: Paystack signs the RAW body, not re-serialised JSON.
+app.use(
+  express.json({
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 
 // ── Firebase Admin ────────────────────────────────────────────────────────
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
@@ -15,29 +22,32 @@ admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 const { FieldValue, Timestamp } = admin.firestore;
 
-// ── RushPay config (V2) ───────────────────────────────────────────────────
-const RUSHPAY_API_KEY        = process.env.RUSHPAY_API_KEY;
-const RUSHPAY_BASE_URL       = "https://core.rushpay.cash";
-const RUSHPAY_API_BASE       = "https://core.rushpay.cash"; // used by the browser widget (it appends /api/v1/merchant/... itself)
-const RUSHPAY_WEBHOOK_SECRET = process.env.RUSHPAY_WEBHOOK_SECRET;
-const SERVER_URL = process.env.SERVER_URL || "https://asempachoir-production.up.railway.app";
+// ── Paystack config ───────────────────────────────────────────────────────
+const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
+// Render sets RENDER_EXTERNAL_URL automatically; SERVER_URL overrides it.
+const SERVER_URL = (process.env.SERVER_URL || process.env.RENDER_EXTERNAL_URL || "").replace(/\/$/, "");
 
 const DUES = { admin: 30, member: 20 };
 
-const rushpay = axios.create({
-  baseURL: RUSHPAY_BASE_URL,
-  headers: { "X-API-Key": RUSHPAY_API_KEY, "Content-Type": "application/json" },
+const paystack = axios.create({
+  baseURL: "https://api.paystack.co",
+  headers: {
+    Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
+    "Content-Type": "application/json",
+  },
+  timeout: 20000,
 });
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 const safeSemesterId = (uid, semester) =>
   `${uid}_${semester.replace(/\//g, "-").replace(/ /g, "_")}`;
 
-// Format amount as a string with 2 decimals (RushPay V2 expects amount as a string)
-const fmtAmount = (n) => Number(n).toFixed(2);
+const DAY_MS = 24 * 60 * 60 * 1000;
+const newReference = (prefix) =>
+  `${prefix}-${Date.now()}-${crypto.randomBytes(5).toString("hex")}`;
 
-// Works for Firestore Timestamps AND the ISO strings older campaigns were saved with.
-// A deadline saved at exactly 00:00:00 is treated as the END of that day.
+// Works for Firestore Timestamps AND ISO strings. A deadline saved at exactly
+// 00:00:00 is treated as the END of that day.
 const toDateSafe = (v) => {
   if (!v) return null;
   const d = typeof v.toDate === "function" ? v.toDate() : new Date(v);
@@ -47,6 +57,23 @@ const toDateSafe = (v) => {
   }
   return d;
 };
+
+/** Start a Paystack checkout. Amount is in GHS; Paystack wants pesewas. */
+async function initPaystack({ email, amountGhs, reference, callbackUrl, metadata }) {
+  const r = await paystack.post("/transaction/initialize", {
+    email,
+    amount: Math.round(Number(amountGhs) * 100),
+    currency: "GHS",
+    reference,
+    callback_url: callbackUrl,
+    channels: ["mobile_money", "card"],
+    metadata,
+  });
+  const data = r.data?.data;
+  if (!r.data?.status || !data?.authorization_url)
+    throw new Error(r.data?.message || "Paystack did not return a checkout link");
+  return data; // { authorization_url, access_code, reference }
+}
 
 // ── Admin guard: the app sends the Firebase ID token with admin requests ──
 async function requireAdmin(req, res, next) {
@@ -69,11 +96,134 @@ async function requireAdmin(req, res, next) {
   }
 }
 
-// ── Health check ──────────────────────────────────────────────────────────
+// ── Health check (also used by the keep-awake pinger) ─────────────────────
 app.get("/", (req, res) => res.json({ status: "Asempa backend running" }));
 
 // ══════════════════════════════════════════════════════════════════════════
-// DUES — Direct RushPay checkout
+// SHARED: checkout redirect, payment processing, verification
+// ══════════════════════════════════════════════════════════════════════════
+
+// The app opens /checkout/:ref or /donations/checkout/:ref in the browser.
+// We look up the Paystack link we stored and send the user there.
+async function redirectToCheckout(req, res) {
+  try {
+    const { reference } = req.params;
+    const [donationSnap, duesSnap] = await Promise.all([
+      db.collection("donation_pending").where("paymentReference", "==", reference).limit(1).get(),
+      db.collection("dues_payments").where("paymentReference", "==", reference).limit(1).get(),
+    ]);
+    const doc = !donationSnap.empty ? donationSnap.docs[0] : !duesSnap.empty ? duesSnap.docs[0] : null;
+    const url = doc?.data()?.authorizationUrl;
+    if (!url) return res.status(404).send("Payment link not found. Please try again.");
+    return res.redirect(url);
+  } catch (err) {
+    console.error("checkout redirect error:", err.message);
+    return res.status(500).send("Checkout failed. Please try again.");
+  }
+}
+app.get("/checkout/:reference", redirectToCheckout);
+app.get("/donations/checkout/:reference", redirectToCheckout);
+
+/**
+ * Credit a successful payment exactly once. Safe to call from the webhook,
+ * the verify endpoint, the success page and the reconcile job.
+ */
+async function processPaidReference(reference, paidAmount) {
+  const [donationSnap, duesSnap] = await Promise.all([
+    db.collection("donation_pending").where("paymentReference", "==", reference).limit(1).get(),
+    db.collection("dues_payments").where("paymentReference", "==", reference).limit(1).get(),
+  ]);
+
+  if (donationSnap.empty && duesSnap.empty) return { unknown: true };
+
+  const isDonation = !donationSnap.empty;
+  const pendingDoc = isDonation ? donationSnap.docs[0] : duesSnap.docs[0];
+
+  // Atomically claim it, so webhook + verify racing can never double-count.
+  const claimed = await db.runTransaction(async (t) => {
+    const snap = await t.get(pendingDoc.ref);
+    if (snap.data().status === "completed") return false;
+    t.update(pendingDoc.ref, {
+      status: "completed",
+      completedAt: FieldValue.serverTimestamp(),
+    });
+    return true;
+  });
+  if (!claimed) return { already: true };
+
+  try {
+    const { uid, campaignId, semester } = pendingDoc.data();
+    const userDoc  = await db.collection("users").doc(uid).get();
+    const userData = userDoc.data() || {};
+    const userName = userData.name ?? userData.fullName ?? "";
+
+    // ── Donation ────────────────────────────────────────────────────
+    if (isDonation) {
+      const campaignRef = db.collection("donation_campaigns").doc(campaignId);
+      await db.runTransaction(async (t) => {
+        const campaignDoc = await t.get(campaignRef);
+        if (!campaignDoc.exists) throw new Error("Campaign not found");
+
+        t.update(campaignRef, {
+          amountRaised: FieldValue.increment(paidAmount),
+          donorCount:   FieldValue.increment(1),
+        });
+        t.set(db.collection("donations").doc(), {
+          uid, campaignId,
+          amount:           paidAmount,
+          name:             userName,
+          voicePart:        userData.voicePart ?? "",
+          paymentReference: reference,
+          donatedAt:        FieldValue.serverTimestamp(),
+        });
+      });
+      console.log(`🙏 Donation recorded: uid=${uid} campaign=${campaignId} amount=${paidAmount}`);
+      return { processed: true, type: "donation" };
+    }
+
+    // ── Dues ────────────────────────────────────────────────────────
+    const isAdmin      = userData.isAdmin === true;
+    const required     = isAdmin ? DUES.admin : DUES.member;
+    const duesRef      = db.collection("dues").doc(safeSemesterId(uid, semester));
+    const duesDoc      = await duesRef.get();
+    const previousPaid = duesDoc.exists ? duesDoc.data().amountPaid ?? 0 : 0;
+    const newTotal     = previousPaid + paidAmount;
+
+    await duesRef.set({
+      uid, semester, amountPaid: newTotal,
+      amountRequired: required,
+      isPaid: newTotal >= required,
+      lastPaymentAt: FieldValue.serverTimestamp(),
+      role:      isAdmin ? "admin" : "member",
+      name:      userName,
+      voicePart: userData.voicePart ?? "",
+    }, { merge: true });
+
+    console.log(`✅ Dues credited: uid=${uid} semester=${semester} amount=${paidAmount}`);
+    return { processed: true, type: "dues" };
+  } catch (err) {
+    // Crediting failed: release the claim so a retry can try again.
+    await pendingDoc.ref.update({ status: "pending" }).catch(() => {});
+    throw err;
+  }
+}
+
+/** Ask Paystack for the truth about a reference, and credit it if paid. */
+async function verifyAndProcess(reference) {
+  const r = await paystack.get(`/transaction/verify/${encodeURIComponent(reference)}`);
+  const tx = r.data?.data;
+  if (!tx) return { status: "unknown" };
+
+  const amount = (tx.amount ?? 0) / 100;
+  if (tx.status !== "success") return { status: tx.status, amount };
+  if (tx.currency && tx.currency !== "GHS") return { status: "wrong-currency", amount };
+
+  const result = await processPaidReference(reference, amount);
+  return { status: "success", amount, ...result };
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// DUES
 // ══════════════════════════════════════════════════════════════════════════
 
 app.post("/create-payment", async (req, res) => {
@@ -89,112 +239,69 @@ app.post("/create-payment", async (req, res) => {
     const user    = userDoc.data();
     const isAdmin = user.isAdmin === true;
     const amount  = isAdmin ? DUES.admin : DUES.member;
+    const reference = newReference("DUES");
 
-    const response = await rushpay.post("/api/v1/merchant/payments/create", {
-      amount: fmtAmount(amount),
-      description: `Asempa Choir Dues — ${semester}`,
-      callback_url: `${SERVER_URL}/payment-success`,
+    const tx = await initPaystack({
+      email: user.email || `${uid}@asempachoir.app`,
+      amountGhs: amount,
+      reference,
+      callbackUrl: `${SERVER_URL}/payment-success`,
       metadata: {
-        uid,
-        semester,
+        uid, semester, type: "dues",
         role: isAdmin ? "admin" : "member",
-        customer_email: user.email,
         customer_name: user.name ?? user.fullName ?? "Member",
       },
     });
 
-    console.log("RushPay create-payment response:", JSON.stringify(response.data, null, 2));
-
-    const payment = response.data?.data ?? response.data;
-    const paymentReference = payment?.payment_reference ?? payment?.reference ?? payment?.id;
-
-    if (!paymentReference)
-      return res.status(500).json({ success: false, message: "Could not get payment reference" });
-
     await db.collection("dues_payments").add({
       uid, semester, amount, role: isAdmin ? "admin" : "member",
-      paymentReference, status: "pending",
+      paymentReference: reference,
+      authorizationUrl: tx.authorization_url,
+      status: "pending",
       createdAt: FieldValue.serverTimestamp(),
     });
 
-    return res.json({ success: true, paymentReference, amount });
+    return res.json({ success: true, paymentReference: reference, amount });
   } catch (err) {
     console.error("create-payment error:", err.response?.data ?? err.message);
     return res.status(500).json({ success: false, message: "Payment creation failed" });
   }
 });
 
-app.get("/checkout/:reference", async (req, res) => {
-  try {
-    const { reference } = req.params;
-    const sessionRes = await rushpay.post("/api/v1/merchant/payments/widget-session", {
-      payment_reference: reference,
-    });
-    const widgetSessionToken = sessionRes.data?.data?.widget_session_token;
-    if (!widgetSessionToken)
-      return res.status(500).send("Could not create widget session");
+const successPage = ({ icon, title, colour, text }) => `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${title}</title>
+<style>body{font-family:-apple-system,sans-serif;background:#f5f5f5;display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center;padding:20px}.card{background:white;border-radius:20px;padding:40px;box-shadow:0 4px 20px rgba(0,0,0,.08);max-width:400px;width:100%}.icon{font-size:64px;margin-bottom:16px}h1{color:${colour};font-size:24px;margin-bottom:8px}p{color:#666;font-size:15px;line-height:1.5}.note{margin-top:20px;font-size:13px;color:#999}</style>
+</head><body><div class="card"><div class="icon">${icon}</div>
+<h1>${title}</h1>
+<p>${text}</p>
+<p class="note">You can close this tab and return to the Asempa app.</p>
+</div></body></html>`;
 
-    const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Asempa Choir — Pay Dues</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      background: #f5f5f5; min-height: 100vh; display: flex;
-      flex-direction: column; align-items: center; padding: 20px; }
-    .header { text-align: center; margin-bottom: 24px; }
-    .header h1 { font-size: 22px; color: #1a1a2e; font-weight: 700; }
-    .header p { font-size: 14px; color: #666; margin-top: 4px; }
-    #rushpay-payment-widget { width: 100%; max-width: 480px; }
-  </style>
-</head>
-<body>
-  <div class="header">
-    <h1>🎵 Asempa Choir</h1>
-    <p>Secure dues payment powered by RushPay</p>
-  </div>
-  <div id="rushpay-payment-widget"></div>
-  <script src="https://core.rushpay.cash/widget/payment-widget-v2.js"></script>
-  <script>
-    RushPayV2.init({
-      apiBase: "${RUSHPAY_API_BASE}",
-      containerId: "rushpay-payment-widget",
-      paymentReference: '${reference}',
-      widgetSessionToken: '${widgetSessionToken}',
-      callbackUrl: '${SERVER_URL}/payment-success'
-    });
-  </script>
-</body>
-</html>`;
-    res.setHeader("Content-Type", "text/html");
-    return res.send(html);
-  } catch (err) {
-    console.error("checkout error:", err.response?.data ?? err.message);
-    return res.status(500).send("Checkout failed. Please try again.");
-  }
+// Paystack sends the user back here with ?reference=... — we double-check the
+// payment right away, so the app updates even if the webhook is late.
+app.get("/payment-success", async (req, res) => {
+  const ref = req.query.reference || req.query.trxref;
+  if (ref) await verifyAndProcess(String(ref)).catch((e) => console.error("success verify:", e.message));
+  res.send(successPage({
+    icon: "✅", title: "Payment Successful!", colour: "#00C853",
+    text: "Your dues have been received. Your record will be updated shortly.",
+  }));
 });
 
-app.get("/payment-success", (req, res) => {
-  res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Payment Successful</title>
-<style>body{font-family:-apple-system,sans-serif;background:#f5f5f5;display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center;padding:20px}.card{background:white;border-radius:20px;padding:40px;box-shadow:0 4px 20px rgba(0,0,0,.08);max-width:400px;width:100%}.icon{font-size:64px;margin-bottom:16px}h1{color:#00C853;font-size:24px;margin-bottom:8px}p{color:#666;font-size:15px;line-height:1.5}.note{margin-top:20px;font-size:13px;color:#999}</style>
-</head><body><div class="card"><div class="icon">✅</div>
-<h1>Payment Successful!</h1>
-<p>Your dues have been received. Your record will be updated shortly.</p>
-<p class="note">You can close this tab and return to the Asempa app.</p>
-</div></body></html>`);
+app.get("/donation-success", async (req, res) => {
+  const ref = req.query.reference || req.query.trxref;
+  if (ref) await verifyAndProcess(String(ref)).catch((e) => console.error("success verify:", e.message));
+  res.send(successPage({
+    icon: "🙏", title: "Thank You!", colour: "#E91E63",
+    text: "Your donation has been received. God bless you for your generosity.",
+  }));
 });
 
 app.get("/verify/:reference", async (req, res) => {
   try {
-    const { reference } = req.params;
-    const response = await rushpay.get(`/api/v1/merchant/payments/status?payment_reference=${reference}`);
-    const payment = response.data?.data ?? response.data;
-    return res.json({ success: true, status: payment.status, amount: payment.amount });
+    const result = await verifyAndProcess(req.params.reference);
+    return res.json({ success: true, status: result.status, amount: result.amount });
   } catch (err) {
     console.error("verify error:", err.response?.data ?? err.message);
     return res.status(500).json({ success: false, message: "Verification failed" });
@@ -298,6 +405,7 @@ app.post("/donations/campaign/:id/remind", requireAdmin, async (req, res) => {
   }
 });
 
+// Member starts a donation
 app.post("/donations/pay", async (req, res) => {
   try {
     const { uid, campaignId } = req.body;
@@ -322,103 +430,32 @@ app.post("/donations/pay", async (req, res) => {
     if (deadline && new Date() > deadline)
       return res.status(400).json({ success: false, message: "This campaign has ended" });
 
-    const response = await rushpay.post("/api/v1/merchant/payments/create", {
-      amount: fmtAmount(amount),
-      description: `Donation — ${campaign.name}`,
-      callback_url: `${SERVER_URL}/donation-success`,
+    const reference = newReference("DON");
+    const tx = await initPaystack({
+      email: user.email || `${uid}@asempachoir.app`,
+      amountGhs: amount,
+      reference,
+      callbackUrl: `${SERVER_URL}/donation-success`,
       metadata: {
-        uid,
-        campaignId,
-        type: "donation",
-        amount,
-        customer_email: user.email,
+        uid, campaignId, type: "donation",
+        campaign_name: campaign.name,
         customer_name: user.name ?? user.fullName ?? "Member",
       },
     });
 
-    console.log("RushPay donation response:", JSON.stringify(response.data, null, 2));
-
-    const payment = response.data?.data ?? response.data;
-    const paymentReference = payment?.payment_reference ?? payment?.reference ?? payment?.id;
-
-    if (!paymentReference)
-      return res.status(500).json({ success: false, message: "Could not get payment reference" });
-
     await db.collection("donation_pending").add({
-      uid, campaignId, amount, paymentReference, status: "pending",
+      uid, campaignId, amount,
+      paymentReference: reference,
+      authorizationUrl: tx.authorization_url,
+      status: "pending",
       createdAt: FieldValue.serverTimestamp(),
     });
 
-    return res.json({ success: true, paymentReference, amount });
+    return res.json({ success: true, paymentReference: reference, amount });
   } catch (err) {
     console.error("donations/pay error:", err.response?.data ?? err.message);
     return res.status(500).json({ success: false, message: "Donation payment creation failed" });
   }
-});
-
-app.get("/donations/checkout/:reference", async (req, res) => {
-  try {
-    const { reference } = req.params;
-    const sessionRes = await rushpay.post("/api/v1/merchant/payments/widget-session", {
-      payment_reference: reference,
-    });
-    const widgetSessionToken = sessionRes.data?.data?.widget_session_token;
-    if (!widgetSessionToken)
-      return res.status(500).send("Could not create widget session");
-
-    const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Asempa Choir — Donate</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      background: #f5f5f5; min-height: 100vh; display: flex;
-      flex-direction: column; align-items: center; padding: 20px; }
-    .header { text-align: center; margin-bottom: 24px; }
-    .header h1 { font-size: 22px; color: #1a1a2e; font-weight: 700; }
-    .header p { font-size: 14px; color: #666; margin-top: 4px; }
-    #rushpay-payment-widget { width: 100%; max-width: 480px; }
-  </style>
-</head>
-<body>
-  <div class="header">
-    <h1>🎵 Asempa Choir</h1>
-    <p>Thank you for your generosity</p>
-  </div>
-  <div id="rushpay-payment-widget"></div>
-  <script src="https://core.rushpay.cash/widget/payment-widget-v2.js"></script>
-  <script>
-    RushPayV2.init({
-      apiBase: "${RUSHPAY_API_BASE}",
-      containerId: "rushpay-payment-widget",
-      paymentReference: '${reference}',
-      widgetSessionToken: '${widgetSessionToken}',
-      callbackUrl: '${SERVER_URL}/donation-success'
-    });
-  </script>
-</body>
-</html>`;
-    res.setHeader("Content-Type", "text/html");
-    return res.send(html);
-  } catch (err) {
-    console.error("donations checkout error:", err.response?.data ?? err.message);
-    return res.status(500).send("Checkout failed. Please try again.");
-  }
-});
-
-app.get("/donation-success", (req, res) => {
-  res.send(`<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Donation Successful</title>
-<style>body{font-family:-apple-system,sans-serif;background:#f5f5f5;display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center;padding:20px}.card{background:white;border-radius:20px;padding:40px;box-shadow:0 4px 20px rgba(0,0,0,.08);max-width:400px;width:100%}.icon{font-size:64px;margin-bottom:16px}h1{color:#E91E63;font-size:24px;margin-bottom:8px}p{color:#666;font-size:15px;line-height:1.5}.note{margin-top:20px;font-size:13px;color:#999}</style>
-</head><body><div class="card"><div class="icon">🙏</div>
-<h1>Thank You!</h1>
-<p>Your donation has been received. God bless you for your generosity.</p>
-<p class="note">You can close this tab and return to the Asempa app.</p>
-</div></body></html>`);
 });
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -439,8 +476,7 @@ function reminderMessage(c, daysLeft) {
 async function remindCampaign(campaignDoc, daysLeft = null) {
   const c = campaignDoc.data();
 
-  // Your webhook writes a `donations` record only after a successful payment,
-  // so every record here is a real donation.
+  // `donations` records are only written after a successful payment.
   const donationsSnap = await db.collection("donations")
     .where("campaignId", "==", campaignDoc.id).get();
   const donated = new Set(donationsSnap.docs.map((d) => d.data().uid));
@@ -471,7 +507,6 @@ async function remindCampaign(campaignDoc, daysLeft = null) {
 
 // Remind 7, 3 and 1 days before the deadline, and on the last day.
 const REMINDER_STAGES = [7, 3, 1, 0];
-const DAY_MS = 24 * 60 * 60 * 1000;
 // Accra is UTC+0 all year, so UTC day maths matches local days.
 const startOfDayUTC = (d) => Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
 
@@ -495,141 +530,90 @@ async function runDailyReminders() {
   }
 }
 
-// Every day at 09:00 Accra time
+/** Safety net: re-check recent pending payments in case a webhook was missed. */
+async function reconcilePending() {
+  const cutoff = Date.now() - 3 * DAY_MS;
+  let checked = 0;
+  for (const col of ["donation_pending", "dues_payments"]) {
+    const snap = await db.collection(col).where("status", "==", "pending").limit(200).get();
+    for (const doc of snap.docs) {
+      const created = doc.data().createdAt?.toMillis?.() ?? 0;
+      if (created < cutoff) continue;
+      try {
+        await verifyAndProcess(doc.data().paymentReference);
+        checked++;
+      } catch (err) {
+        console.error("Reconcile failed for", doc.data().paymentReference, err.response?.data?.message ?? err.message);
+      }
+    }
+  }
+  return checked;
+}
+
+async function runDailyJobs() {
+  await runDailyReminders();
+  return reconcilePending();
+}
+
+// Every day at 09:00 Accra time (works while the server is awake)
 cron.schedule("0 9 * * *", () => {
-  runDailyReminders().catch((e) => console.error("Daily reminders error:", e.message));
+  runDailyJobs().catch((e) => console.error("Daily jobs error:", e.message));
 }, { timezone: "Africa/Accra" });
 
-// Optional: lets an external scheduler trigger it if Railway ever sleeps the service.
-// Set CRON_SECRET in Railway variables, then POST with header x-cron-secret.
+// For an external scheduler (cron-job.org). Set CRON_SECRET in Render,
+// then POST here with header  x-cron-secret: <your secret>
 app.post("/donations/cron/run", async (req, res) => {
   if (!process.env.CRON_SECRET || req.headers["x-cron-secret"] !== process.env.CRON_SECRET)
     return res.status(403).json({ success: false });
-  await runDailyReminders();
-  return res.json({ success: true });
+  try {
+    const checked = await runDailyJobs();
+    return res.json({ success: true, reconciled: checked });
+  } catch (err) {
+    console.error("cron/run error:", err.message);
+    return res.status(500).json({ success: false });
+  }
 });
 
 // ══════════════════════════════════════════════════════════════════════════
-// WEBHOOK
+// PAYSTACK WEBHOOK
+//   Dashboard → Settings → API Keys & Webhooks → set the Webhook URL to
+//   https://<your-render-url>/webhook
 // ══════════════════════════════════════════════════════════════════════════
 
 app.post("/webhook", async (req, res) => {
   try {
-    const signature = req.headers["x-rushpay-signature"];
-    console.log("📩 Webhook received");
-    console.log("   Signature header:", signature);
-    console.log("   Body:", JSON.stringify(req.body));
-
-    if (!signature) {
-      console.warn("⚠️  No signature header — rejecting");
+    const signature = req.headers["x-paystack-signature"];
+    if (!signature || !req.rawBody)
       return res.status(401).json({ success: false, message: "No signature" });
-    }
 
-    const rawBody = JSON.stringify(req.body);
+    // Paystack signs the RAW body with HMAC-SHA512 using your secret key
     const expected = crypto
-      .createHmac("sha256", RUSHPAY_WEBHOOK_SECRET)
-      .update(rawBody)
+      .createHmac("sha512", PAYSTACK_SECRET_KEY)
+      .update(req.rawBody)
       .digest("hex");
 
-    const sigBuf = Buffer.from(signature);
+    const sigBuf = Buffer.from(String(signature));
     const expBuf = Buffer.from(expected);
     if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
-      console.warn("⚠️  Signature mismatch — expected:", expected, "got:", signature);
+      console.warn("⚠️  Webhook signature mismatch");
       return res.status(401).json({ success: false, message: "Invalid signature" });
     }
 
-    console.log("✅ Signature verified");
-
     const event = req.body;
-    if (event.event !== "payment.completed") {
-      console.log("ℹ️  Event ignored:", event.event);
+    if (event.event !== "charge.success") {
       return res.json({ success: true, message: "Event ignored" });
     }
 
-    const { payment_reference, amount } = event.data;
+    const data = event.data || {};
+    if (data.status !== "success" || (data.currency && data.currency !== "GHS"))
+      return res.json({ success: true, message: "Not a successful GHS payment" });
 
-    // ── Look up by reference — don't rely on metadata ─────────────────
-    const [donationSnap, duesSnap] = await Promise.all([
-      db.collection("donation_pending")
-        .where("paymentReference", "==", payment_reference).limit(1).get(),
-      db.collection("dues_payments")
-        .where("paymentReference", "==", payment_reference).limit(1).get(),
-    ]);
-
-    if (donationSnap.empty && duesSnap.empty) {
-      console.warn("⚠️  No pending record found for:", payment_reference);
-      return res.status(400).json({ success: false, message: "Unknown payment reference" });
+    const result = await processPaidReference(data.reference, (data.amount ?? 0) / 100);
+    if (result.unknown) {
+      console.warn("ℹ️  Webhook for unknown reference:", data.reference);
+      return res.json({ success: true, message: "Unknown reference" }); // 200 so Paystack stops retrying
     }
-
-    const isDonation = !donationSnap.empty;
-    const pendingDoc = isDonation ? donationSnap.docs[0] : duesSnap.docs[0];
-
-    // Webhooks can be delivered more than once — never count a payment twice
-    if (pendingDoc.data().status === "completed") {
-      console.log("ℹ️  Already processed:", payment_reference);
-      return res.json({ success: true, message: "Already processed" });
-    }
-
-    const { uid, campaignId, semester } = pendingDoc.data();
-
-    // Mark pending as completed
-    await pendingDoc.ref.update({
-      status: "completed",
-      completedAt: FieldValue.serverTimestamp(),
-    });
-
-    // ── Donation ──────────────────────────────────────────────────────
-    if (isDonation) {
-      const campaignRef = db.collection("donation_campaigns").doc(campaignId);
-      const userDoc     = await db.collection("users").doc(uid).get();
-      const userData    = userDoc.data();
-      const userName    = userData?.name ?? userData?.fullName ?? "";
-
-      await db.runTransaction(async (t) => {
-        const campaignDoc = await t.get(campaignRef);
-        if (!campaignDoc.exists) throw new Error("Campaign not found");
-
-        t.update(campaignRef, {
-          amountRaised: FieldValue.increment(amount),
-          donorCount:   FieldValue.increment(1),
-        });
-
-        t.set(db.collection("donations").doc(), {
-          uid, campaignId, amount,
-          name:             userName,
-          voicePart:        userData?.voicePart ?? "",
-          paymentReference: payment_reference,
-          donatedAt:        FieldValue.serverTimestamp(),
-        });
-      });
-
-      console.log(`🙏 Donation recorded: uid=${uid} campaign=${campaignId} amount=${amount}`);
-      return res.json({ success: true });
-    }
-
-    // ── Dues ──────────────────────────────────────────────────────────
-    const duesRef      = db.collection("dues").doc(safeSemesterId(uid, semester));
-    const duesDoc      = await duesRef.get();
-    const previousPaid = duesDoc.exists ? duesDoc.data().amountPaid ?? 0 : 0;
-    const newTotal     = previousPaid + amount;
-    const userDoc      = await db.collection("users").doc(uid).get();
-    const userData     = userDoc.data();
-    const isAdmin      = userData?.isAdmin === true;
-    const userName     = userData?.name ?? userData?.fullName ?? "";
-
-    await duesRef.set({
-      uid, semester, amountPaid: newTotal,
-      amountRequired: isAdmin ? DUES.admin : DUES.member,
-      isPaid: newTotal >= (isAdmin ? DUES.admin : DUES.member),
-      lastPaymentAt: FieldValue.serverTimestamp(),
-      role:      isAdmin ? "admin" : "member",
-      name:      userName,
-      voicePart: userData?.voicePart ?? "",
-    }, { merge: true });
-
-    console.log(`✅ Dues credited: uid=${uid} semester=${semester} amount=${amount}`);
     return res.json({ success: true });
-
   } catch (err) {
     console.error("webhook error:", err.message);
     return res.status(500).json({ success: false, message: "Webhook processing failed" });
