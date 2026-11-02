@@ -603,6 +603,7 @@ app.post("/webhook", async (req, res) => {
     if (event.event !== "charge.success") {
       return res.json({ success: true, message: "Event ignored" });
     }
+    console.log("📩 Paystack webhook:", event.event, event.data?.reference);
 
     const data = event.data || {};
     if (data.status !== "success" || (data.currency && data.currency !== "GHS"))
