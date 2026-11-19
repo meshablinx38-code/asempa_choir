@@ -226,6 +226,9 @@ async function verifyAndProcess(reference) {
 // DUES
 // ══════════════════════════════════════════════════════════════════════════
 
+// Smallest instalment a member may pay (set DUES_MIN_PAYMENT on Render to change it)
+const MIN_DUES_PAYMENT = Number(process.env.DUES_MIN_PAYMENT) || 5;
+
 app.post("/create-payment", async (req, res) => {
   try {
     const { uid, semester } = req.body;
@@ -236,9 +239,32 @@ app.post("/create-payment", async (req, res) => {
     if (!userDoc.exists)
       return res.status(404).json({ success: false, message: "User not found" });
 
-    const user    = userDoc.data();
-    const isAdmin = user.isAdmin === true;
-    const amount  = isAdmin ? DUES.admin : DUES.member;
+    const user     = userDoc.data();
+    const isAdmin  = user.isAdmin === true;
+    const required = isAdmin ? DUES.admin : DUES.member;
+
+    // How much has this member already paid this semester?
+    const duesDoc = await db.collection("dues").doc(safeSemesterId(uid, semester)).get();
+    const alreadyPaid = duesDoc.exists ? Number(duesDoc.data().amountPaid) || 0 : 0;
+    const remaining = Math.max(0, Math.round((required - alreadyPaid) * 100) / 100);
+
+    if (remaining <= 0)
+      return res.status(400).json({ success: false, message: "Your dues for this semester are already fully paid" });
+
+    // The member chooses how much to pay now (default: the full balance)
+    let amount = req.body.amount === undefined || req.body.amount === null
+      ? remaining
+      : Number(req.body.amount);
+    if (!Number.isFinite(amount))
+      return res.status(400).json({ success: false, message: "Invalid amount" });
+    amount = Math.round(amount * 100) / 100;
+
+    const minAllowed = Math.min(MIN_DUES_PAYMENT, remaining);
+    if (amount < minAllowed)
+      return res.status(400).json({ success: false, message: `The minimum payment is GHS ${minAllowed}` });
+    if (amount > remaining)
+      return res.status(400).json({ success: false, message: `You only owe GHS ${remaining} this semester` });
+
     const reference = newReference("DUES");
 
     const tx = await initPaystack({
@@ -261,7 +287,7 @@ app.post("/create-payment", async (req, res) => {
       createdAt: FieldValue.serverTimestamp(),
     });
 
-    return res.json({ success: true, paymentReference: reference, amount });
+    return res.json({ success: true, paymentReference: reference, amount, remainingAfter: Math.round((remaining - amount) * 100) / 100 });
   } catch (err) {
     console.error("create-payment error:", err.response?.data ?? err.message);
     return res.status(500).json({ success: false, message: "Payment creation failed" });
@@ -603,6 +629,7 @@ app.post("/webhook", async (req, res) => {
     if (event.event !== "charge.success") {
       return res.json({ success: true, message: "Event ignored" });
     }
+
     console.log("📩 Paystack webhook:", event.event, event.data?.reference);
 
     const data = event.data || {};
